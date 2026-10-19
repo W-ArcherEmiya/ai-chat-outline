@@ -108,6 +108,37 @@ test('stale DOM fiber resolves to committed navigation owner', () => {
     assert.equal(f.sandbox.getChatGptMessageNavigationApi().entries.length, 5);
 });
 
+test('detached old ref cannot hide the committed navigation API', () => {
+    const f = fixture();
+    f.oldOwner.memoizedProps = { ...f.oldOwner.memoizedProps, ref: { current: null } };
+    assert.equal(f.sandbox.getChatGptMessageNavigationApi().api, f.owner.memoizedProps.ref.current);
+});
+
+test('returning to the same conversation does not resume the prior visit navigation', async () => {
+    const f = fixture();
+    const source = f.owner.child.memoizedProps.conversationSource;
+    const original = source.search;
+    source.search = async query => {
+        f.state.chatGptRouteChanges = 2;
+        await original(query);
+    };
+    await f.navigate();
+    assert.equal(f.counts().apiCalls, 0);
+});
+
+test('same conversation in a new visit does not reuse an old pending history request', async () => {
+    const f = fixture();
+    const first = f.sandbox.loadChatGptNativeHistory({ search: () => new Promise(() => {}) });
+    const rejected = assert.rejects(first, /history-load-cancelled/);
+    await Promise.resolve();
+    f.state.chatGptRouteChanges = 2;
+    const second = f.sandbox.loadChatGptNativeHistory({ search: async () => {} });
+    assert.notEqual(first, second);
+    await second;
+    await rejected;
+    assert.equal(f.state.chatGptHistoryLoad, null);
+});
+
 test('target in alternate tree does not skip history loading', async () => {
     const f = fixture();
     const nav = f.sandbox.getChatGptMessageNavigationApi();
@@ -245,7 +276,7 @@ test('startup API absence is deferred, then a later render can preload', async (
     const f = fixture();
     const api = f.owner.memoizedProps.ref.current;
     f.owner.memoizedProps.ref.current = null;
-    f.sandbox.scheduleChatGptHistoryWarmup(7);
+    f.sandbox.scheduleChatGptHistoryWarmup(19);
     await new Promise(resolve => setTimeout(resolve, 850));
     assert.equal(f.state.chatGptHistoryWarmupDebug.mode, 'history-warmup-deferred');
     assert.notEqual(f.state.chatGptNavigationStatus, 'error');
@@ -264,4 +295,45 @@ test('an actual background history failure still exposes retry', async () => {
     await new Promise(resolve => setTimeout(resolve, 350));
     assert.equal(f.state.chatGptNavigationStatus, 'error');
     assert.equal(f.state.chatGptHistoryWarmupDebug.mode, 'remote-message-history-error');
+});
+
+test('click waits for late native API and then navigates without coordinate fallback', async () => {
+    const f = fixture();
+    const api = f.owner.memoizedProps.ref.current;
+    f.owner.memoizedProps.ref.current = null;
+    const wait = f.sandbox.waitForMilliseconds;
+    f.sandbox.waitForMilliseconds = async ms => {
+        assert.equal(f.state.chatGptNavigationStatus, 'loading');
+        f.owner.memoizedProps.ref.current = api;
+        f.sandbox.waitForMilliseconds = wait;
+        await wait(ms);
+    };
+    await f.sandbox.waitForChatGptNavigationAndNavigate({}, 116);
+    assert.equal(f.counts().apiCalls, 1);
+    assert.equal(f.state.lastNavigationDebug.mode, 'remote-message-api-visible');
+    assert.equal(f.state.chatGptPendingClick, null);
+    assert.equal(f.state.chatGptNavigationStatus, '');
+});
+
+test('waiting for API times out to retry state with no navigation attempt', async () => {
+    const f = fixture();
+    f.owner.memoizedProps.ref.current = null;
+    await f.sandbox.waitForChatGptNavigationAndNavigate({}, 116);
+    assert.equal(f.state.lastNavigationDebug.mode, 'remote-message-api-not-ready');
+    assert.equal(f.state.chatGptNavigationStatus, 'error');
+    assert.equal(f.state.chatGptPendingClick, null);
+    assert.equal(f.counts().apiCalls, 0);
+});
+
+test('new click supersedes pending API wait without clearing its marker', async () => {
+    const f = fixture();
+    f.owner.memoizedProps.ref.current = null;
+    const nextClick = {};
+    f.sandbox.waitForMilliseconds = async () => {
+        f.state.lastTocClick = nextClick;
+        f.state.chatGptPendingClick = nextClick;
+    };
+    await f.sandbox.waitForChatGptNavigationAndNavigate({}, 116);
+    assert.equal(f.state.chatGptPendingClick, nextClick);
+    assert.equal(f.counts().apiCalls, 0);
 });

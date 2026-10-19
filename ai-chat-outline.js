@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.9
+// @version      2.8.10
 // @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('ai-chat-outline v2.8.9: started');
+    console.log('ai-chat-outline v2.8.10: started');
 
     function getPageWindow() {
         try {
@@ -95,6 +95,8 @@
         chatGptCatalogMessages: [],
         chatGptCatalogContext: '',
         chatGptCatalogSource: '',
+        chatGptPreviousMessageIds: new Set(),
+        chatGptPreviousMessageNodes: new WeakSet(),
         chatGptHistoryLoad: null,
         chatGptHistoryWarmupTimer: 0,
         chatGptHistoryWarmupContext: '',
@@ -816,10 +818,40 @@
         return true;
     }
 
+    function rememberChatGptPreviousMessages() {
+        // Retain earlier route identities too: A's DOM may outlive a rapid A -> B -> C switch.
+        STATE.chatGptPreviousMessageIds ||= new Set();
+        STATE.chatGptPreviousMessageNodes ||= new WeakSet();
+        for (const message of STATE.messages.concat(STATE.chatGptCatalogMessages, STATE.remoteMessages)) {
+            getMessageIdentityKeys(message).forEach(key => STATE.chatGptPreviousMessageIds.add(key));
+            for (const node of [message.anchor, message.container]) {
+                if (node) STATE.chatGptPreviousMessageNodes.add(node);
+            }
+        }
+    }
+
+    function collectChatGptNewChatMessages(liveMessages, context) {
+        const messages = liveMessages.filter(message => {
+            const keys = getMessageIdentityKeys(message);
+            if (keys.length) return !keys.some(key => STATE.chatGptPreviousMessageIds.has(key));
+            return ![message.anchor, message.container].some(node => node && STATE.chatGptPreviousMessageNodes.has(node));
+        });
+        // Unsaved chats have no authoritative history to retain across DOM removal.
+        replaceChatGptCatalog(messages, context, 'new-chat-live');
+        STATE.lastTocSource = 'new-chat-live';
+        return messages;
+    }
+
     function resetChatGptConversationState(nextContext, source) {
         const previousContext = STATE.chatGptRouteContext || STATE.chatGptCatalogContext || STATE.remoteMessageContext || '';
         if (previousContext === nextContext && STATE.chatGptRouteContext === nextContext) return false;
 
+        if (/^chatgpt:/.test(previousContext)) rememberChatGptPreviousMessages();
+        STATE.cancelBoundaryNavigation?.();
+        cancelClickNavigationTracking();
+        STATE.lastTocClick = null;
+        STATE.activeIndex = -1;
+        STATE.forcedActiveIndex = -1;
         STATE.chatGptRouteContext = nextContext;
         clearChatGptHistoryWarmup();
         STATE.chatGptRouteChanges += 1;
@@ -917,15 +949,38 @@
         return '';
     }
 
-    function getConversationMessageText(message) {
-        if (!message || !message.content) return '';
-
-        const content = message.content;
-        if (Array.isArray(content.parts)) {
-            return normalizePlainText(content.parts.map(flattenConversationPart).filter(Boolean).join(' '));
+    function getChatGptAttachmentLabel(message) {
+        const attachments = [];
+        const metadata = message.metadata || {};
+        for (const list of [metadata.attachments, message.attachments]) {
+            if (Array.isArray(list)) attachments.push(...list);
         }
+        const parts = message.content && message.content.parts;
+        if (Array.isArray(parts)) {
+            attachments.push(...parts.filter(part => part && typeof part === 'object' &&
+                /^(file|file_attachment|document|input_file)$/i.test(String(part.content_type || part.type || ''))));
+        }
+        const names = [];
+        const seen = new Set();
+        let count = 0;
+        for (const attachment of attachments) {
+            if (!attachment || typeof attachment !== 'object') continue;
+            const name = [attachment.name, attachment.filename, attachment.file_name]
+                .find(value => typeof value === 'string' && value.trim());
+            const key = attachment.id || attachment.file_id || name;
+            if (key && seen.has(key)) continue;
+            if (key) seen.add(key);
+            count++;
+            if (name) names.push(normalizePlainText(name));
+        }
+        if (names.length) return `文件：${names.join('、')}`;
+        return count > 1 ? `文件 x${count}` : count ? '文件' : '';
+    }
 
-        return normalizePlainText(flattenConversationPart(content));
+    function getConversationMessageText(message) {
+        if (!message) return '';
+        const text = normalizePlainText(flattenConversationPart(message.content));
+        return text || getChatGptAttachmentLabel(message);
     }
 
     function getChatGptConversationCandidate(data) {
@@ -1459,6 +1514,22 @@
                         !!(tailElement.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING)
                     ));
                 });
+            }
+        }
+        if (!detectedPendingMessages.length && STATE.pendingLiveContext === context &&
+            STATE.pendingLiveCatalogMessages.length) {
+            // Virtualization can remove the server tail while newer confirmed live messages remain.
+            const pending = STATE.pendingLiveCatalogMessages;
+            const tailKeys = getMessageIdentityKeys(pending[pending.length - 1]);
+            const pendingTailIndex = liveMessages.findIndex(message =>
+                getMessageIdentityKeys(message).some(key => tailKeys.includes(key)));
+            if (pendingTailIndex >= 0) {
+                const knownKeys = new Set(pending.flatMap(getMessageIdentityKeys));
+                const additions = liveMessages.slice(pendingTailIndex + 1).filter((message, offset) =>
+                    message.text && liveRemoteIndexes[pendingTailIndex + 1 + offset] < 0 &&
+                    !getMessageIdentityKeys(message).some(key => knownKeys.has(key)));
+                detectedPendingMessages = pending.filter(message =>
+                    !getMessageIdentityKeys(message).some(key => remoteByIdentity.has(key))).concat(additions);
             }
         }
         if (detectedPendingMessages.length) {
@@ -2105,7 +2176,7 @@
             }, new Map()).values()).filter((group) => group.length > 1);
 
             return {
-                version: '2.8.9',
+                version: '2.8.10',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -2220,9 +2291,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.9';
+        window.__aiTocVersion = '2.8.10';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.9';
+        pageWindow.__aiTocVersion = '2.8.10';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -3367,7 +3438,7 @@
         if (!left || !right) return false;
         const leftKeys = getMessageIdentityKeys(left);
         const rightKeys = getMessageIdentityKeys(right);
-        if (leftKeys.length && rightKeys.length && leftKeys.some((key) => rightKeys.includes(key))) return true;
+        if (leftKeys.length && rightKeys.length) return leftKeys.some((key) => rightKeys.includes(key));
         const leftText = getComparableMessageText(left.text);
         const rightText = getComparableMessageText(right.text);
         return !!leftText && leftText === rightText;
@@ -3498,7 +3569,7 @@
                 const comparable = getComparableMessageText(snapshot.text);
                 const candidates = comparable ? liveByText.get(comparable) || [] : [];
                 if (catalogTextCounts.get(comparable) === 1 && candidates.length === 1) {
-                    liveMessage = candidates[0];
+                    if (areClaudeCatalogMessagesEqual(snapshot, candidates[0])) liveMessage = candidates[0];
                 }
             }
             if (!liveMessage || usedLiveMessages.has(liveMessage)) return snapshot;
@@ -3515,6 +3586,35 @@
         });
         STATE.claudeCatalogMessages = snapshotChatGptCatalogMessages(rebound);
         return rebound;
+    }
+
+    function mergeClaudeRemoteCatalogWithLiveTail(remoteMessages, liveMessages, context) {
+        let catalog = snapshotChatGptCatalogMessages(remoteMessages);
+        const previous = STATE.claudeCatalogMessages;
+        // Keep confirmed local additions only while the server branch remains a prefix.
+        if (STATE.claudeCatalogContext === context && previous.length > catalog.length &&
+            catalog.every((message, index) => areClaudeCatalogMessagesEqual(message, previous[index]))) {
+            catalog = snapshotChatGptCatalogMessages(previous);
+        }
+        const overlap = getClaudeSequenceOverlap(catalog, liveMessages);
+        if (!overlap) return catalog;
+        const tail = catalog[catalog.length - 1];
+        const liveTail = liveMessages[overlap - 1];
+        const keys = getMessageIdentityKeys(tail);
+        const idMatched = keys.some(key => getMessageIdentityKeys(liveTail).includes(key));
+        // Text-only boundaries must be unique; repeated prompts cannot prove continuity.
+        if (!idMatched) {
+            const text = getComparableMessageText(tail.text);
+            if (catalog.filter(message => getComparableMessageText(message.text) === text).length !== 1 ||
+                liveMessages.filter(message => getComparableMessageText(message.text) === text).length !== 1) return catalog;
+        }
+        for (const message of liveMessages.slice(overlap)) {
+            const identities = getMessageIdentityKeys(message);
+            if (identities.length && catalog.some(existing =>
+                getMessageIdentityKeys(existing).some(key => identities.includes(key)))) continue;
+            catalog.push(snapshotChatGptCatalogMessage(message, catalog.length));
+        }
+        return catalog;
     }
 
     const SITE_ADAPTERS = {
@@ -3566,17 +3666,25 @@
             },
             mergeMessages(liveMessages) {
                 const context = getChatGptMessageCacheContext();
+                if (!getChatGptConversationId()) return collectChatGptNewChatMessages(liveMessages, context);
                 const waitingForCurrentConversation = !!getChatGptConversationId() &&
                     !(
                         STATE.remoteMessageContext === context &&
                         STATE.remoteMessageIsAuthoritative &&
                         STATE.remoteMessages.length
-                    ) &&
-                    Date.now() - STATE.chatGptRouteChangedAt < 2000;
+                    );
                 if (waitingForCurrentConversation) {
                     STATE.lastTocSource = 'chatgpt-awaiting-current-conversation';
                     return [];
                 }
+                const currentIds = new Set(STATE.remoteMessages.flatMap(getMessageIdentityKeys));
+                liveMessages = liveMessages.filter(message => {
+                    const keys = getMessageIdentityKeys(message);
+                    if (keys.some(key => currentIds.has(key))) return true;
+                    if (keys.some(key => STATE.chatGptPreviousMessageIds.has(key))) return false;
+                    if (keys.length) return true;
+                    return ![message.anchor, message.container].some(node => node && STATE.chatGptPreviousMessageNodes.has(node));
+                });
                 annotateMessagesWithNativeToc(liveMessages);
                 if (
                     STATE.remoteMessageContext === context &&
@@ -3718,7 +3826,7 @@
                 const directMessages = collectClaudeDirectDomMessages();
                 if (STATE.claudeRemoteContext === context && STATE.claudeRemoteMessages.length) {
                     replaceClaudeCatalog(
-                        STATE.claudeRemoteMessages,
+                        mergeClaudeRemoteCatalogWithLiveTail(STATE.claudeRemoteMessages, directMessages, context),
                         context,
                         `${STATE.claudeRemoteSource || 'claude-api'}-current-branch`
                     );
@@ -4987,12 +5095,18 @@
         const identityMatch = findLiveUserElementByIdentityKeys(getMessageIdentityKeys(message));
         if (identityMatch) {
             const identityContainer = resolveClaudeMessageContainer(identityMatch) || identityMatch;
-            if (!isClaudeComposerElement(identityContainer) && matchesTargetText(identityContainer)) {
+            if (identityContainer.isConnected && !isClaudeComposerElement(identityContainer)) {
                 return { element: identityContainer, source: 'virtual-id' };
             }
         }
 
-        const textMatches = elements.filter(matchesTargetText);
+        const targetKeys = getMessageIdentityKeys(message);
+        const textMatches = elements.filter(element => {
+            const candidateKeys = createMessageIdentityKeys(getMessageIdentityKeyFromElement(element));
+            if (targetKeys.length && candidateKeys.length &&
+                !targetKeys.some(key => candidateKeys.includes(key))) return false;
+            return matchesTargetText(element);
+        });
         if (Number.isFinite(targetRow)) {
             const rowMatch = textMatches.find((element) => getClaudeVirtualRowIndex(element) === targetRow);
             if (rowMatch) return { element: rowMatch, source: 'virtual-row-text', rowIndex: targetRow };
@@ -5093,7 +5207,8 @@
 
         for (let attempt = 0; attempt < 8 && token === STATE.claudeJumpToken; attempt++) {
             rows = getClaudeMountedVirtualRows();
-            targetRow = getClaudePredictedVirtualRow(message, rows);
+            const predictedRow = getClaudePredictedVirtualRow(message, rows);
+            if (Number.isFinite(predictedRow)) targetRow = predictedRow;
             targetRow = Math.max(0, Math.min(Math.round(targetRow), totalRows - 1));
             directMatch = findClaudeDirectUserElement(message, index, targetRow);
             if (directMatch) {
@@ -5149,6 +5264,15 @@
         }
 
         if (token !== STATE.claudeJumpToken) return false;
+        // The final scroll can mount the target after the loop's last pre-scroll check.
+        directMatch = findClaudeDirectUserElement(message, index, targetRow);
+        if (directMatch) {
+            STATE.lastNavigationDebug = {
+                mode: `claude-${directMatch.source}`, index, targetRow, totalRows, attempts,
+                identityKeys: getMessageIdentityKeys(message)
+            };
+            return scrollClaudeUserElementIntoView(directMatch.element);
+        }
         STATE.lastNavigationDebug = {
             mode: 'claude-virtual-target-not-mounted',
             index,
@@ -5840,200 +5964,9 @@
         return true;
     }
 
-    function scrollChatGptSlotForRevive(slot) {
-        if (!slot || !slot.isConnected) return false;
 
-        const container = findScrollContainerForElement(slot);
-        if (STATE.scrollContainer !== container) bindScrollSync(container);
 
-        const viewport = getViewportRect(container);
-        const slotTop = getElementAbsoluteTop(slot, container);
-        if (typeof slotTop === 'number') {
-            scrollTargetToInstant(container, slotTop - viewport.height * 0.45);
-        } else {
-            try {
-                slot.scrollIntoView({ block: 'center', behavior: 'instant' });
-            } catch (error) {
-                try {
-                    slot.scrollIntoView({ block: 'center' });
-                } catch (innerError) {
-                    return false;
-                }
-            }
-        }
 
-        pokeChatGptLazyMount(container, slot);
-        if (container && !isWindowScrollTarget(container)) {
-            container.dispatchEvent(new Event('scroll', { bubbles: true }));
-        }
-        window.dispatchEvent(new Event('resize'));
-        return true;
-    }
-
-    function resolveMountedChatGptRemoteTarget(message, index) {
-        const identityKeys = getMessageIdentityKeys(message);
-        const identityMatch = findLiveUserElementByIdentityKeys(identityKeys);
-        if (identityMatch) return { element: identityMatch, source: 'remote-id' };
-
-        const turnShell = getChatGptTurnShellByIdentityKeys(identityKeys);
-        const turnUser = getChatGptSlotRoleElement(turnShell, 'user');
-        if (turnUser) return { element: turnUser, source: 'remote-turn-id' };
-
-        const slotMatch = findLiveUserElementInSlot(message, index);
-        if (slotMatch) return slotMatch;
-
-        const remoteIndex = getMessageRemoteIndex(message, index);
-        const alignedMatch = getCurrentTextAlignmentMatches().find((match) => match.remoteIndex === remoteIndex);
-        if (alignedMatch && alignedMatch.source === 'message-id') {
-            return { element: alignedMatch.element, source: 'remote-aligned-id' };
-        }
-
-        if (alignedMatch) {
-            const comparable = getChatGptRenderedComparableText(message.text);
-            const duplicateCount = STATE.remoteMessages.filter((candidate) => (
-                getChatGptRenderedComparableText(candidate.text) === comparable
-            )).length;
-            if (duplicateCount === 1) {
-                return { element: alignedMatch.element, source: 'remote-unique-text' };
-            }
-        }
-
-        return null;
-    }
-
-    async function seekMountedChatGptRemoteTarget(message, index) {
-        const remoteIndex = getMessageRemoteIndex(message, index);
-        const total = STATE.remoteMessages.length || STATE.messages.length;
-        if (remoteIndex < 0 || !total) return null;
-
-        let matches = getCurrentTextAlignmentMatches();
-        const sampleElement = matches.length ? matches[0].element : null;
-        let container = sampleElement
-            ? findScrollContainerForElement(sampleElement)
-            : (getChatGptFallbackScrollContainer() || getActiveScrollContainer());
-        if (getScrollMaxTop(container) <= 0) {
-            const fallbackContainer = getChatGptFallbackScrollContainer();
-            if (fallbackContainer) container = fallbackContainer;
-        }
-        if (STATE.scrollContainer !== container) bindScrollSync(container);
-
-        const viewport = getViewportRect(container);
-        let lower = { index: -1, top: 0 };
-        let upper = { index: total, top: getScrollMaxTop(container) + viewport.height };
-        let previousTop = -1;
-
-        for (let attempt = 0; attempt < 36; attempt++) {
-            const mounted = resolveMountedChatGptRemoteTarget(message, index);
-            if (mounted) return mounted;
-
-            matches = getCurrentTextAlignmentMatches();
-            const turnMatches = getCurrentChatGptTurnAlignmentMatches();
-            const positionalMatches = matches.concat(turnMatches);
-            let targetTurnTop = null;
-            positionalMatches.forEach((match) => {
-                const top = getElementAbsoluteTop(match.element, container);
-                if (typeof top !== 'number') return;
-                if (match.remoteIndex === remoteIndex) {
-                    targetTurnTop = typeof targetTurnTop === 'number' ? Math.min(targetTurnTop, top) : top;
-                }
-                if (match.remoteIndex < remoteIndex && match.remoteIndex > lower.index) {
-                    lower = { index: match.remoteIndex, top };
-                }
-                if (match.remoteIndex > remoteIndex && match.remoteIndex < upper.index) {
-                    upper = { index: match.remoteIndex, top };
-                }
-            });
-
-            const indexSpan = Math.max(1, upper.index - lower.index);
-            const ratio = clampNumber((remoteIndex - lower.index) / indexSpan, 0, 1);
-            const targetAbsoluteTop = lower.top + (upper.top - lower.top) * ratio;
-            const offset = Math.min(120, Math.max(72, viewport.height * 0.12));
-            const maxTop = getScrollMaxTop(container);
-            const visibleRemoteIndexes = Array.from(new Set(positionalMatches.map((match) => match.remoteIndex)))
-                .sort((left, right) => left - right);
-            const minimumVisibleIndex = visibleRemoteIndexes.length ? visibleRemoteIndexes[0] : null;
-            const maximumVisibleIndex = visibleRemoteIndexes.length
-                ? visibleRemoteIndexes[visibleRemoteIndexes.length - 1]
-                : null;
-            let seekStrategy = 'estimated-position';
-            let nextTop;
-            if (typeof targetTurnTop === 'number') {
-                seekStrategy = 'target-turn';
-                nextTop = targetTurnTop - viewport.height * 0.7;
-            } else if (maximumVisibleIndex !== null && maximumVisibleIndex < remoteIndex) {
-                seekStrategy = 'load-next-segment';
-                nextTop = maxTop;
-            } else if (minimumVisibleIndex !== null && minimumVisibleIndex > remoteIndex) {
-                seekStrategy = 'load-previous-segment';
-                nextTop = 0;
-            } else {
-                nextTop = targetAbsoluteTop - offset;
-            }
-            nextTop = clampNumber(nextTop, 0, maxTop);
-            const currentTop = getScrollTop(container);
-
-            if (Math.abs(nextTop - currentTop) < 24 && seekStrategy === 'estimated-position') {
-                const direction = positionalMatches.length &&
-                    positionalMatches.every((match) => match.remoteIndex > remoteIndex) ? -1 : 1;
-                nextTop = clampNumber(
-                    currentTop + direction * Math.max(240, viewport.height * 0.55),
-                    0,
-                    maxTop
-                );
-            }
-            if (nextTop === previousTop && nextTop !== 0 && nextTop !== maxTop) {
-                nextTop = clampNumber(nextTop + (remoteIndex > lower.index ? 96 : -96), 0, maxTop);
-            }
-
-            STATE.lastNavigationDebug = {
-                mode: 'remote-id-index-seek',
-                index,
-                remoteIndex,
-                attempt: attempt + 1,
-                identityKeys: getMessageIdentityKeys(message),
-                currentTop: Math.round(currentTop),
-                nextTop: Math.round(nextTop),
-                lowerIndex: lower.index,
-                lowerTop: Math.round(lower.top),
-                upperIndex: upper.index,
-                upperTop: Math.round(upper.top),
-                visibleRemoteIndexes,
-                seekStrategy,
-                targetTurnTop: typeof targetTurnTop === 'number' ? Math.round(targetTurnTop) : null,
-                scrollMaxTop: Math.round(maxTop),
-                scrollContainer: isWindowScrollTarget(container)
-                    ? 'window'
-                    : describeClaudeScrollContainer(container),
-                targetText: message.text.slice(0, 80)
-            };
-
-            previousTop = nextTop;
-            scrollTargetToInstant(container, nextTop);
-            pokeChatGptLazyMount(container, null);
-            await waitForMilliseconds(220);
-        }
-
-        return null;
-    }
-
-    async function waitForMountedChatGptRemoteTarget(message, index, timeout) {
-        const endAt = Date.now() + timeout;
-        while (Date.now() < endAt) {
-            await waitForMilliseconds(60);
-            scanContent();
-            const nextIndex = findMessageIndexByIdentityKeys(getMessageIdentityKeys(message));
-            const nextMessage = nextIndex >= 0 ? STATE.messages[nextIndex] : message;
-            const target = resolveMountedChatGptRemoteTarget(nextMessage, nextIndex >= 0 ? nextIndex : index);
-            if (target) {
-                return {
-                    match: target,
-                    message: nextMessage,
-                    index: nextIndex >= 0 ? nextIndex : index
-                };
-            }
-        }
-        return null;
-    }
 
     function getCommittedChatGptNavigationFiber(fiber) {
         let root = fiber;
@@ -6063,7 +5996,7 @@
             let fiber = key ? root[key] : null;
             for (let depth = 0; fiber && depth < 30; depth++, fiber = fiber.return) {
                 let props = fiber.memoizedProps;
-                if (typeof props?.ref?.current?.scrollToMessage !== 'function') continue;
+                if (!props?.ref && !fiber.alternate?.memoizedProps?.ref) continue;
                 const committed = getCommittedChatGptNavigationFiber(fiber);
                 if (!committed) continue;
                 props = committed.memoizedProps;
@@ -6174,11 +6107,12 @@
 
     function loadChatGptNativeHistory(source) {
         const context = getChatGptMessageCacheContext();
+        const generation = STATE.chatGptRouteChanges || 0;
         const pending = STATE.chatGptHistoryLoad;
-        if (pending?.context === context) return pending.promise;
+        if (pending?.context === context && pending.generation === generation) return pending.promise;
         pending?.controller.abort();
         const controller = new AbortController();
-        const job = { context, controller, promise: null };
+        const job = { context, generation, controller, promise: null };
         STATE.chatGptHistoryLoad = job;
         job.promise = (async () => {
             let timer;
@@ -6186,7 +6120,7 @@
                 controller.signal.addEventListener('abort', () => reject(new Error('history-load-cancelled')), { once: true });
             });
             const watch = window.setInterval(() => {
-                if (context !== getChatGptMessageCacheContext()) controller.abort();
+                if (context !== getChatGptMessageCacheContext() || generation !== (STATE.chatGptRouteChanges || 0)) controller.abort();
             }, 100);
             try {
                 await Promise.race([
@@ -6214,10 +6148,12 @@
     function scheduleChatGptHistoryWarmup(attempt = 0) {
         if (ADAPTER.id !== 'chatgpt' || !getChatGptConversationId()) return;
         const context = getChatGptMessageCacheContext();
+        const generation = STATE.chatGptRouteChanges || 0;
+        const isCurrent = () => context === getChatGptMessageCacheContext() && generation === (STATE.chatGptRouteChanges || 0);
         if (STATE.chatGptHistoryWarmupTimer || STATE.chatGptHistoryWarmupContext === context) return;
         STATE.chatGptHistoryWarmupTimer = window.setTimeout(() => {
             STATE.chatGptHistoryWarmupTimer = 0;
-            if (context !== getChatGptMessageCacheContext()) return;
+            if (!isCurrent()) return;
             const navigation = getChatGptMessageNavigationApi();
             const mountedIds = new Set((navigation?.entries || []).flatMap(entry => entry?.turn?.messageIds || []));
             const message = STATE.messages.find(message => {
@@ -6229,18 +6165,24 @@
                 });
             });
             // A new chat's mounted first message needs no native history preload.
-            if (!message) {
+            const awaitingNavigation = !navigation && STATE.remoteMessages?.length > 1;
+            if (!message && !awaitingNavigation) {
                 if (!STATE.chatGptHistoryLoad && !STATE.chatGptPendingClick) setChatGptNavigationStatus('');
                 return;
             }
             if (!navigation || !findChatGptHistorySearchSource(navigation)) {
-                if (attempt < 7) {
+                if (awaitingNavigation || STATE.remoteMessages?.length > 1) setChatGptNavigationStatus('loading');
+                if (attempt < 19) {
                     scheduleChatGptHistoryWarmup(attempt + 1);
                 }
                 else {
                     // Missing startup prerequisites are not a failed history request.
                     // A later render may retry once the page has installed its API.
                     STATE.chatGptHistoryWarmupDebug = { context, mode: 'history-warmup-deferred' };
+                    if (STATE.remoteMessages?.length > 1 && !STATE.chatGptPendingClick) {
+                        STATE.chatGptHistoryWarmupContext = context;
+                        setChatGptNavigationStatus('error');
+                    }
                 }
                 return;
             }
@@ -6249,10 +6191,10 @@
             STATE.chatGptHistoryWarmupDebug = debug;
             // Only populate the page's native history; do not invoke any scrolling API.
             void prepareChatGptMessageNavigation(navigation, getMessageIdentityKeys(message),
-                () => context === getChatGptMessageCacheContext(), debug).then(result => {
+                isCurrent, debug).then(result => {
                 debug.durationMs = Date.now() - debug.startedAt;
                 if (result) debug.mode = 'history-warmup-ready';
-                if (context === getChatGptMessageCacheContext()) setChatGptNavigationStatus(result ? '' : 'error');
+                if (isCurrent()) setChatGptNavigationStatus(result ? '' : 'error');
             });
         }, attempt ? 750 : 250);
     }
@@ -6315,11 +6257,12 @@
 
     async function performChatGptMessageNavigation(navigation, message, index) {
         const context = getChatGptMessageCacheContext();
+        const generation = STATE.chatGptRouteChanges || 0;
         const click = STATE.lastTocClick;
-        const isCurrent = () => context === getChatGptMessageCacheContext() && click === STATE.lastTocClick;
+        const isCurrent = () => context === getChatGptMessageCacheContext() && generation === (STATE.chatGptRouteChanges || 0) && click === STATE.lastTocClick;
         const identityKeys = getMessageIdentityKeys(message);
         const debug = {
-            mode: 'remote-message-api-start', index, identityKeys,
+            mode: 'remote-message-api-start', index, identityKeys, generation,
             scrollMethod: 'native-scrollToMessage',
             remoteIndex: getMessageRemoteIndex(message, index)
         };
@@ -6392,132 +6335,67 @@
         return true;
     }
 
+    async function waitForChatGptNavigationAndNavigate(message, index) {
+        const context = getChatGptMessageCacheContext();
+        const generation = STATE.chatGptRouteChanges || 0;
+        const click = STATE.lastTocClick;
+        const isCurrent = () => context === getChatGptMessageCacheContext() &&
+            generation === (STATE.chatGptRouteChanges || 0) && STATE.lastTocClick === click;
+        const debug = { mode: 'remote-message-api-waiting', index, generation, identityKeys: getMessageIdentityKeys(message) };
+        STATE.lastNavigationDebug = debug;
+        STATE.chatGptPendingClick = click;
+        setChatGptNavigationStatus('loading');
+        syncChatGptNavigationFeedback();
+        const startedAt = Date.now();
+        try {
+            while (isCurrent() && Date.now() - startedAt < 15000) {
+                const navigation = getChatGptMessageNavigationApi();
+                if (navigation) {
+                    setChatGptNavigationStatus('');
+                    return await navigateWithChatGptMessageApi(navigation, message, index);
+                }
+                await waitForMilliseconds(120);
+            }
+            if (isCurrent()) {
+                debug.mode = 'remote-message-api-not-ready';
+                debug.waitDurationMs = Date.now() - startedAt;
+                setChatGptNavigationStatus('error');
+            }
+            return true;
+        } finally {
+            if (STATE.chatGptPendingClick === click) {
+                STATE.chatGptPendingClick = null;
+                syncChatGptNavigationFeedback();
+            }
+        }
+    }
+
     async function navigateWithChatGptRemoteToc(message, index) {
         const navigationApi = getChatGptMessageNavigationApi();
         if (navigationApi) return navigateWithChatGptMessageApi(navigationApi, message, index);
-        const identityKeys = getMessageIdentityKeys(message);
-        const remoteIndex = getMessageRemoteIndex(message, index);
-        let liveMatch = resolveMountedChatGptRemoteTarget(message, index);
-        if (liveMatch) {
-            const domIdentityKey = attachResolvedUserElementToMessage(message, liveMatch.element, liveMatch.source || 'remote-mounted');
-            STATE.lastNavigationDebug = {
-                mode: `remote-${liveMatch.source || 'mounted'}-hit`,
-                index,
-                remoteIndex,
-                identityKeys,
-                domIdentityKey,
-                targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
-                slotText: liveMatch.slotText || ''
-            };
-            scrollExactUserElementIntoView(liveMatch.element, index, 'auto');
-            return true;
-        }
+        if (getChatGptConversationId()) return waitForChatGptNavigationAndNavigate(message, index);
 
-        const slot = getChatGptTurnShellByIdentityKeys(identityKeys) || getChatGptUserSlotElement(remoteIndex);
-        if (!slot || !slot.isConnected) {
-            STATE.lastNavigationDebug = {
-                mode: 'remote-slot-missing-seek-start',
-                index,
-                remoteIndex,
-                identityKeys,
-                hasConvRoot: !!getChatGptMessageSlotRoot(),
-                turnShells: getChatGptTurnShells().length,
-                text: message.text.slice(0, 80)
-            };
-            const soughtTarget = await seekMountedChatGptRemoteTarget(message, index);
-            if (!soughtTarget) {
-                STATE.lastNavigationDebug = Object.assign({}, STATE.lastNavigationDebug, {
-                    mode: 'remote-id-index-seek-timeout'
-                });
-                return false;
+        const identityKeys = getMessageIdentityKeys(message);
+        const target = identityKeys.length
+            ? findLiveUserElementByIdentityKeys(identityKeys)
+            : getMessageTarget(message);
+        if (target && target.isConnected) {
+            attachResolvedUserElementToMessage(message, target, 'new-chat-mounted');
+            STATE.lastNavigationDebug = { mode: 'new-chat-mounted', index, identityKeys };
+            try {
+                target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+            } catch (error) {
+                STATE.lastNavigationDebug.mode = 'new-chat-navigation-error';
+                STATE.lastNavigationDebug.error = String(error?.message || error);
+                setChatGptNavigationStatus('error');
+                return true;
             }
-            const domIdentityKey = attachResolvedUserElementToMessage(
-                message,
-                soughtTarget.element,
-                soughtTarget.source || 'remote-id-index-seek'
-            );
-            STATE.lastNavigationDebug = {
-                mode: `remote-${soughtTarget.source || 'id-index-seek'}-hit`,
-                index,
-                remoteIndex,
-                identityKeys,
-                domIdentityKey,
-                targetText: normalizeMessageText(soughtTarget.element).slice(0, 80)
-            };
-            scrollExactUserElementIntoView(soughtTarget.element, index, 'auto');
+            setChatGptNavigationStatus('');
             scheduleActiveSync();
             return true;
         }
-
-        const slotDebug = getChatGptSlotDebug(slot);
-        const slotSource = getChatGptSlotSource(slot, remoteIndex);
-        STATE.lastNavigationDebug = {
-            mode: 'remote-slot-revive-start',
-            index,
-            remoteIndex,
-            childIndex: 1 + remoteIndex * 2,
-            slotSource,
-            identityKeys,
-            slotRole: slotDebug.role,
-            slotMessageId: slotDebug.messageId,
-            slotTurnId: slotDebug.turnId,
-            slotText: slotDebug.text,
-            slotHasLastKnownHeight: slotDebug.hasLastKnownHeight,
-            slotHeight: slotDebug.height,
-            text: message.text.slice(0, 80)
-        };
-        if (!scrollChatGptSlotForRevive(slot)) return false;
-
-        let resolved = await waitForMountedChatGptRemoteTarget(message, index, 2600);
-        if (!resolved) {
-            const latestSlot = getChatGptTurnShellByIdentityKeys(identityKeys) || getChatGptUserSlotElement(remoteIndex);
-            const latestSlotDebug = getChatGptSlotDebug(latestSlot);
-            STATE.lastNavigationDebug = {
-                mode: 'remote-slot-timeout',
-                index,
-                remoteIndex,
-                childIndex: 1 + remoteIndex * 2,
-                slotSource: getChatGptSlotSource(latestSlot, remoteIndex),
-                identityKeys,
-                slotRole: latestSlotDebug.role,
-                slotMessageId: latestSlotDebug.messageId,
-                slotTurnId: latestSlotDebug.turnId,
-                slotText: latestSlotDebug.text,
-                slotHasLastKnownHeight: latestSlotDebug.hasLastKnownHeight,
-                slotHeight: latestSlotDebug.height,
-                text: message.text.slice(0, 80)
-            };
-            const soughtTarget = await seekMountedChatGptRemoteTarget(message, index);
-            if (!soughtTarget) return false;
-            resolved = {
-                match: soughtTarget,
-                message,
-                index
-            };
-        }
-
-        liveMatch = resolved.match;
-        const resolvedMessage = resolved.message;
-        const resolvedIndex = resolved.index;
-        const domIdentityKey = attachResolvedUserElementToMessage(
-            resolvedMessage,
-            liveMatch.element,
-            liveMatch.source || 'remote-revived'
-        );
-        STATE.clickLockIndex = resolvedIndex;
-        setActiveIndex(resolvedIndex);
-        STATE.lastNavigationDebug = {
-            mode: `remote-${liveMatch.source || 'revived'}-hit`,
-            index: resolvedIndex,
-            requestedIndex: index,
-            remoteIndex: getMessageRemoteIndex(resolvedMessage, resolvedIndex),
-            identityKeys,
-            domIdentityKey,
-            targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
-            slotText: liveMatch.slotText || ''
-        };
-        scrollExactUserElementIntoView(liveMatch.element, resolvedIndex, 'auto');
-        scheduleActiveSync();
+        STATE.lastNavigationDebug = { mode: 'new-chat-target-unavailable', index, identityKeys };
+        setChatGptNavigationStatus('error');
         return true;
     }
 
